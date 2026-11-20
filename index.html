@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow, noarchive">
+<meta name="referrer" content="no-referrer">
+<title>Private page</title>
+<style id="gate-style">
+:root { color-scheme: light dark }
+body { margin: 0; min-height: 100vh; display: grid; place-items: center; font: 16px/1.5 ui-sans-serif, -apple-system, "Segoe UI", Arial, sans-serif;
+  background: #f3f5f4; color: #17211e }
+@media (prefers-color-scheme: dark) { body { background: #111615; color: #e7ecea } #gate input { background: #19201e; color: inherit; border-color: #2b3532 } }
+#gate { width: min(360px, calc(100vw - 32px)); display: flex; flex-direction: column; gap: 10px }
+#gate h1 { font-size: 20px; margin: 0 0 4px }
+#gate label { font-size: 13px }
+#gate input { font: inherit; padding: 10px 12px; border: 1px solid #d9dfdc; border-radius: 8px; width: 100%; box-sizing: border-box }
+#gate button { font: inherit; font-weight: 600; padding: 10px 12px; border: 0; border-radius: 8px; background: #0f5c4d; color: #fff; cursor: pointer }
+#gate button:disabled { opacity: .6; cursor: default }
+#gate p { margin: 0; font-size: 14px; min-height: 1.5em }
+</style>
+</head>
+<body>
+<form id="gate" autocomplete="off">
+<h1>Private page</h1>
+<label for="pass">Passphrase</label>
+<input id="pass" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" autofocus>
+<button id="go" type="submit">Open</button>
+<p id="msg" role="alert"></p>
+</form>
+<script>
+(function () {
+  var SALT = '1fee868576122dcec2737eb2ef8ab1f2', ITER = 600000, MAIN = 'main.bin';
+  var gate = document.getElementById('gate'), pass = document.getElementById('pass'), go = document.getElementById('go');
+  var msg = document.getElementById('msg'), key = null, urls = {};
+  function unhex(h) { var u = new Uint8Array(h.length / 2); for (var i = 0; i < u.length; i++) u[i] = parseInt(h.substr(i * 2, 2), 16); return u; }
+  function hex(buf) { return [].map.call(new Uint8Array(buf), function (b) { return ('0' + b.toString(16)).slice(-2); }).join(''); }
+  function importKey(raw) { return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['decrypt']); }
+  function derive(text) {
+    var bytes = new TextEncoder().encode(text.normalize('NFKC').trim());
+    return crypto.subtle.importKey('raw', bytes, 'PBKDF2', false, ['deriveBits']).then(function (k) {
+      return crypto.subtle.deriveBits({ name: 'PBKDF2', salt: unhex(SALT), iterations: ITER, hash: 'SHA-256' }, k, 256);
+    });
+  }
+  function decrypt(buf) { return crypto.subtle.decrypt({ name: 'AES-GCM', iv: new Uint8Array(buf, 0, 12) }, key, new Uint8Array(buf, 12)); }
+  function load(file, fresh) {
+    return fetch(file, fresh ? { cache: 'no-store' } : {}).then(function (r) {
+      if (!r.ok) throw { net: true, message: 'HTTP ' + r.status };
+      return r.arrayBuffer();
+    }, function () { throw { net: true, message: 'no connection' }; }).then(decrypt);
+  }
+  function mount(data) {
+    // the page asks for its other files through this; each is fetched and decrypted when first needed
+    window.siteAsset = function (path) {
+      var a = data.assets[path];
+      if (!a) return Promise.reject(new Error('that file is not on this site'));
+      if (!urls[path]) urls[path] = load('a/' + a.f).then(function (buf) { return URL.createObjectURL(new Blob([buf], { type: a.t })); });
+      return urls[path];
+    };
+    var doc = new DOMParser().parseFromString(data.html, 'text/html'), scripts = [];
+    gate.remove(); document.getElementById('gate-style').remove();
+    document.title = doc.title;
+    [].forEach.call(doc.head.querySelectorAll('style'), function (s) { document.head.appendChild(document.importNode(s, true)); });
+    document.body.removeAttribute('style');
+    [].slice.call(doc.body.childNodes).forEach(function (n) {
+      n = document.importNode(n, true);
+      if (n.nodeType === 1) [].forEach.call(n.tagName === 'SCRIPT' ? [n] : n.querySelectorAll('script'), function (s) { scripts.push(s.textContent); if (s !== n) s.remove(); });
+      if (!(n.nodeType === 1 && n.tagName === 'SCRIPT')) document.body.appendChild(n);
+    });
+    scripts.forEach(function (code) { var s = document.createElement('script'); s.textContent = code; document.body.appendChild(s); });
+    var lock = document.createElement('button');
+    lock.type = 'button'; lock.textContent = 'Lock'; lock.title = 'Forget the passphrase in this tab and close the page';
+    lock.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:5;font:600 13px/1 ui-sans-serif,-apple-system,Arial,sans-serif;' +
+      'padding:8px 12px;border-radius:999px;border:1px solid var(--line,#d9dfdc);background:var(--surface,#fff);color:var(--ink-2,#4a5854);cursor:pointer';
+    lock.addEventListener('click', function () { try { sessionStorage.removeItem('k'); } catch (e) {} location.reload(); });
+    document.body.appendChild(lock);
+  }
+  function open(raw, remember) {
+    return importKey(raw).then(function (k) { key = k; return load(MAIN, true); }).then(function (buf) {
+      if (remember) { try { sessionStorage.setItem('k', hex(raw)); } catch (e) {} }
+      mount(JSON.parse(new TextDecoder().decode(buf)));
+    });
+  }
+  function fail(err) {
+    go.disabled = false; pass.disabled = false;
+    msg.textContent = err && err.net ? 'Could not load the page (' + err.message + '). Try again.' : 'That passphrase did not open the page.';
+    if (!(err && err.net)) { pass.select(); }
+  }
+  if (!window.crypto || !crypto.subtle) { msg.textContent = 'This browser cannot decrypt the page. Open it over https in a current browser.'; go.disabled = true; return; }
+  gate.addEventListener('submit', function (ev) {
+    ev.preventDefault(); if (!pass.value) return;
+    go.disabled = true; pass.disabled = true; msg.textContent = 'Opening\u2026';
+    derive(pass.value).then(function (raw) { pass.value = ''; return open(raw, true); }).catch(fail);
+  });
+  // a reload in the same tab reopens without asking again; closing the tab, or Lock, forgets the key
+  var saved = null; try { saved = sessionStorage.getItem('k'); } catch (e) {}
+  if (saved) { go.disabled = true; pass.disabled = true; msg.textContent = 'Opening\u2026';
+    open(unhex(saved).buffer, false).catch(function (err) { try { sessionStorage.removeItem('k'); } catch (e) {} fail(err && err.net ? err : null); msg.textContent = err && err.net ? msg.textContent : ''; }); }
+})();
+</script>
+</body>
+</html>
